@@ -25,6 +25,8 @@ interface SessionState {
   qrRaw: string | null;
   lastError: string | null;
   initializing: boolean;
+  manualDisconnect: boolean;
+  generation: number;
   reconnectTimer: NodeJS.Timeout | null;
 }
 
@@ -32,6 +34,11 @@ interface HistorySyncInput {
   vendedorId: string;
   contactPhone: string;
   limit: number;
+}
+
+interface ActiveCardLink {
+  card_id: string | null;
+  contact_phone: string | null;
 }
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -42,6 +49,10 @@ const sessionRoot = process.env.BAILEYS_SESSION_DIR || "/data/sessions";
 const apiToken = (process.env.API_TOKEN || "").trim();
 
 const sessions = new Map<string, SessionState>();
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 let supabaseAdmin: SupabaseClient | null = null;
 
@@ -75,6 +86,13 @@ function textValue(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function timeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    promise,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
 function ensureSessionState(vendedorId: string): SessionState {
   const existing = sessions.get(vendedorId);
   if (existing) return existing;
@@ -86,6 +104,8 @@ function ensureSessionState(vendedorId: string): SessionState {
     qrRaw: null,
     lastError: null,
     initializing: false,
+    manualDisconnect: false,
+    generation: 0,
     reconnectTimer: null,
   };
 
@@ -96,11 +116,18 @@ function ensureSessionState(vendedorId: string): SessionState {
 function sessionStatusPayload(state: SessionState) {
   return {
     vendedor_id: state.vendedorId,
+    instance_name: buildInstanceName(state.vendedorId),
     status: state.status,
     connected: state.status === "connected",
     qr_raw: state.qrRaw,
     last_error: state.lastError,
   };
+}
+
+function assertValidVendedorId(vendedorId: string) {
+  if (!/^[a-zA-Z0-9_-]{8,80}$/.test(vendedorId)) {
+    throw new Error("vendedor_id is invalid");
+  }
 }
 
 async function updateConnectionRow(state: SessionState) {
@@ -116,8 +143,6 @@ async function updateConnectionRow(state: SessionState) {
         vendedor_id: state.vendedorId,
         instance_name: instanceName,
         status: state.status,
-        webhook_configured: false,
-        webhook_last_error: state.lastError,
         updated_at: new Date().toISOString(),
       },
       { onConflict: "vendedor_id" },
@@ -128,6 +153,50 @@ function buildInstanceName(vendedorId: string) {
   const prefix = (process.env.BAILEYS_INSTANCE_PREFIX || "crm-").trim().toLowerCase();
   const clean = vendedorId.replace(/[^a-z0-9]/gi, "").toLowerCase();
   return `${prefix}${clean}`;
+}
+
+function sessionDirFor(vendedorId: string) {
+  assertValidVendedorId(vendedorId);
+  const root = path.resolve(sessionRoot);
+  const sessionDir = path.resolve(root, vendedorId);
+  if (!sessionDir.startsWith(`${root}${path.sep}`)) {
+    throw new Error("Invalid session path");
+  }
+  return sessionDir;
+}
+
+function clearReconnectTimer(state: SessionState) {
+  if (!state.reconnectTimer) return;
+  clearTimeout(state.reconnectTimer);
+  state.reconnectTimer = null;
+}
+
+async function closeSocket(state: SessionState, logout = true) {
+  const sock = state.sock;
+  state.sock = null;
+  if (!sock) return;
+
+  try {
+    if (logout) await timeout(sock.logout(), 5000);
+    else sock.end(undefined);
+  } catch {
+    try {
+      sock.end(undefined);
+    } catch {
+      // ignore socket cleanup errors
+    }
+  }
+}
+
+async function removeSessionDir(vendedorId: string) {
+  await fs.rm(sessionDirFor(vendedorId), { recursive: true, force: true });
+}
+
+async function waitForInitialization(state: SessionState, timeoutMs = 6000) {
+  const startedAt = Date.now();
+  while (state.initializing && Date.now() - startedAt < timeoutMs) {
+    await sleep(100);
+  }
 }
 
 function parseDisconnectCode(error: unknown): number | null {
@@ -188,14 +257,19 @@ async function resolveCardIdForPhone(vendedorId: string, phone: string) {
   const supabase = getSupabaseAdmin();
   if (!supabase) return null;
 
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("whatsapp_card_active_links")
     .select("card_id, contact_phone")
     .eq("vendedor_id", vendedorId)
     .eq("active", true);
 
+  if (error) {
+    logger.error({ error, vendedorId }, "failed to resolve active whatsapp card link");
+    return null;
+  }
+
   const normalized = normalizePhone(phone);
-  for (const row of data || []) {
+  for (const row of (data || []) as ActiveCardLink[]) {
     const linked = normalizePhone(row.contact_phone || "");
     if (!linked) continue;
     if (linked.endsWith(normalized) || normalized.endsWith(linked)) {
@@ -206,14 +280,30 @@ async function resolveCardIdForPhone(vendedorId: string, phone: string) {
   return null;
 }
 
+async function resolveRequestedCardIdForPhone(vendedorId: string, phone: string, requestedCardId: string | null) {
+  const linkedCardId = await resolveCardIdForPhone(vendedorId, phone);
+  if (!linkedCardId) return null;
+  if (requestedCardId && requestedCardId !== linkedCardId) return null;
+  return requestedCardId || linkedCardId;
+}
+
+function isDirectChatJid(remoteJid: string) {
+  return remoteJid.endsWith("@s.whatsapp.net") || remoteJid.endsWith("@c.us");
+}
+
+function contactPhoneFromJid(remoteJid: string) {
+  if (!isDirectChatJid(remoteJid)) return "";
+  return normalizePhone((remoteJid.split("@")[0] || remoteJid || "").trim());
+}
+
 async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   const supabase = getSupabaseAdmin();
-  if (!supabase) return;
+  if (!supabase) return false;
 
   const key = item.key;
   const remoteJid = key?.remoteJid || "";
-  const contactPhone = normalizePhone((remoteJid.split("@")[0] || remoteJid || "").trim());
-  if (!contactPhone) return;
+  const contactPhone = contactPhoneFromJid(remoteJid);
+  if (!contactPhone) return false;
 
   const content = extractMessageText(item.message) || "[media]";
   const direction = key?.fromMe ? "out" : "in";
@@ -221,13 +311,14 @@ async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   const createdAt = messageTimestampToIso(item.messageTimestamp) || new Date().toISOString();
   const messageType = content === "[media]" ? "media" : "text";
   const cardId = await resolveCardIdForPhone(vendedorId, contactPhone);
+  if (!cardId) return false;
 
   const payload = {
     vendedor_id: vendedorId,
     card_id: cardId,
     contact_phone: contactPhone,
     contact_phone_last8: normalizePhoneLast8(contactPhone),
-    contact_name: "",
+    contact_name: textValue(item.pushName),
     direction,
     content,
     message_type: messageType,
@@ -236,10 +327,14 @@ async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   };
 
   if (externalId) {
-    await supabase.from("whatsapp_messages").upsert(payload, { onConflict: "vendedor_id,external_id" });
+    const { error } = await supabase.from("whatsapp_messages").upsert(payload, { onConflict: "vendedor_id,external_id" });
+    if (error) throw error;
   } else {
-    await supabase.from("whatsapp_messages").insert(payload);
+    const { error } = await supabase.from("whatsapp_messages").insert(payload);
+    if (error) throw error;
   }
+
+  return true;
 }
 
 async function scheduleReconnect(vendedorId: string, delayMs = 2500) {
@@ -257,26 +352,38 @@ async function scheduleReconnect(vendedorId: string, delayMs = 2500) {
 }
 
 async function startSession(vendedorId: string, forceRestart = false) {
+  assertValidVendedorId(vendedorId);
   const state = ensureSessionState(vendedorId);
 
-  if (state.initializing) return state;
+  if (state.initializing) {
+    for (let attempt = 0; attempt < 50 && state.initializing; attempt += 1) {
+      await sleep(100);
+    }
+    if (state.initializing) return state;
+  }
+
   if (state.sock && !forceRestart) return state;
 
   state.initializing = true;
+  state.manualDisconnect = false;
+  clearReconnectTimer(state);
 
-  if (forceRestart && state.sock) {
-    try {
-      await state.sock.logout();
-    } catch {
-      // ignore
-    }
-    state.sock = null;
+  if (forceRestart) {
+    state.generation += 1;
+    state.manualDisconnect = true;
+    await closeSocket(state, true);
     state.status = "disconnected";
     state.qrRaw = null;
+    state.lastError = null;
+    await removeSessionDir(vendedorId);
+    state.manualDisconnect = false;
   }
 
+  state.generation += 1;
+  const sessionGeneration = state.generation;
+
   try {
-    const sessionDir = path.join(sessionRoot, vendedorId);
+    const sessionDir = sessionDirFor(vendedorId);
     await fs.mkdir(sessionDir, { recursive: true });
 
     const { state: authState, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -301,6 +408,8 @@ async function startSession(vendedorId: string, forceRestart = false) {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
+      if (state.generation !== sessionGeneration) return;
+
       const connection = update.connection;
       if (update.qr) {
         state.qrRaw = update.qr;
@@ -318,19 +427,28 @@ async function startSession(vendedorId: string, forceRestart = false) {
       if (connection === "close") {
         const code = parseDisconnectCode(update.lastDisconnect?.error);
         const loggedOut = code === DisconnectReason.loggedOut;
+        const shouldDeleteAuth = loggedOut || code === DisconnectReason.badSession || code === DisconnectReason.connectionReplaced;
 
         state.status = "disconnected";
         state.lastError = code ? `Disconnected (${code})` : "Disconnected";
         state.sock = null;
+        state.qrRaw = null;
+
+        if (shouldDeleteAuth) {
+          await removeSessionDir(vendedorId);
+        }
+
         await updateConnectionRow(state);
 
-        if (!loggedOut) {
+        if (!state.manualDisconnect && !loggedOut && !shouldDeleteAuth) {
           await scheduleReconnect(vendedorId);
         }
       }
     });
 
     sock.ev.on("messages.upsert", async (payload) => {
+      if (state.generation !== sessionGeneration) return;
+
       try {
         for (const message of payload.messages || []) {
           if (!message?.message) continue;
@@ -347,27 +465,53 @@ async function startSession(vendedorId: string, forceRestart = false) {
   }
 }
 
-async function disconnectSession(vendedorId: string) {
+async function waitForQrOrConnection(state: SessionState, timeoutMs = 12000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (state.qrRaw || state.status === "connected" || state.status === "disconnected") return state;
+    await sleep(250);
+  }
+  return state;
+}
+
+async function resetSession(vendedorId: string, reason = "manual_reset") {
+  assertValidVendedorId(vendedorId);
   const state = ensureSessionState(vendedorId);
-  if (state.reconnectTimer) {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
-  }
+  state.generation += 1;
+  state.manualDisconnect = true;
+  clearReconnectTimer(state);
+  await waitForInitialization(state);
+  await closeSocket(state, true);
+  await removeSessionDir(vendedorId);
 
-  try {
-    if (state.sock) {
-      await state.sock.logout();
-    }
-  } catch {
-    // ignore
-  }
-
-  state.sock = null;
   state.status = "disconnected";
   state.qrRaw = null;
   state.lastError = null;
+  state.initializing = false;
+  logger.info({ vendedorId, reason }, "session auth state removed");
   await updateConnectionRow(state);
   return state;
+}
+
+async function stopAllSessions(reason: string) {
+  const states = Array.from(sessions.values());
+  await Promise.all(
+    states.map(async (state) => {
+      state.generation += 1;
+      state.manualDisconnect = true;
+      clearReconnectTimer(state);
+      await closeSocket(state, false);
+      state.status = "disconnected";
+      state.qrRaw = null;
+      state.lastError = reason;
+      await updateConnectionRow(state);
+    }),
+  );
+}
+
+async function disconnectSession(vendedorId: string) {
+  assertValidVendedorId(vendedorId);
+  return resetSession(vendedorId, "disconnect_requested");
 }
 
 async function syncHistory(input: HistorySyncInput) {
@@ -387,8 +531,8 @@ async function syncHistory(input: HistorySyncInput) {
   let synced = 0;
   for (const msg of messages || []) {
     if (!msg?.message) continue;
-    await storeMessage(input.vendedorId, msg);
-    synced += 1;
+    const stored = await storeMessage(input.vendedorId, msg);
+    if (stored) synced += 1;
   }
 
   return { synced, skipped: false };
@@ -408,11 +552,25 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
 }
 
 function requireVendedorId(req: Request, res: Response) {
-  const vendedorId = textValue(req.query.vendedor_id) || textValue(req.body?.vendedor_id);
+  const vendedorId = textValue(req.query.vendedor_id) || textValue(req.body?.vendedor_id) || textValue(req.headers["x-vendedor-id"]);
   if (!vendedorId) {
     res.status(400).json({ error: "vendedor_id is required" });
     return null;
   }
+
+  try {
+    assertValidVendedorId(vendedorId);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "vendedor_id is invalid" });
+    return null;
+  }
+
+  const instanceName = textValue(req.query.instance_name) || textValue(req.body?.instance_name) || textValue(req.headers["x-instance-name"]);
+  if (instanceName && instanceName !== buildInstanceName(vendedorId)) {
+    res.status(400).json({ error: "instance_name does not match vendedor_id" });
+    return null;
+  }
+
   return vendedorId;
 }
 
@@ -453,7 +611,9 @@ app.post("/session/refresh-qr", async (req, res) => {
     const vendedorId = requireVendedorId(req, res);
     if (!vendedorId) return;
 
-    const state = await startSession(vendedorId, true);
+    const forceNew = req.body?.force_new !== false;
+    const state = await startSession(vendedorId, forceNew);
+    await waitForQrOrConnection(state);
     const payload = sessionStatusPayload(state);
     const qrImageDataUrl = state.qrRaw ? await QRCode.toDataURL(state.qrRaw) : null;
 
@@ -473,6 +633,33 @@ app.post("/session/disconnect", async (req, res) => {
     res.json(sessionStatusPayload(state));
   } catch (error) {
     logger.error({ error }, "session/disconnect failed");
+    res.status(500).json({ error: error instanceof Error ? error.message : "Internal error" });
+  }
+});
+
+app.post("/session/reset", async (req, res) => {
+  try {
+    const vendedorId = requireVendedorId(req, res);
+    if (!vendedorId) return;
+
+    const reason = textValue(req.body?.reason) || "manual_reset";
+    const state = await resetSession(vendedorId, reason);
+    res.json(sessionStatusPayload(state));
+  } catch (error) {
+    logger.error({ error }, "session/reset failed");
+    res.status(500).json({ error: error instanceof Error ? error.message : "Internal error" });
+  }
+});
+
+app.post("/session/logout", async (req, res) => {
+  try {
+    const vendedorId = requireVendedorId(req, res);
+    if (!vendedorId) return;
+
+    const state = await resetSession(vendedorId, "logout_requested");
+    res.json(sessionStatusPayload(state));
+  } catch (error) {
+    logger.error({ error }, "session/logout failed");
     res.status(500).json({ error: error instanceof Error ? error.message : "Internal error" });
   }
 });
@@ -505,7 +692,8 @@ app.post("/message/send", async (req, res) => {
     const externalId = textValue((result as any)?.key?.id) || null;
     const supabase = getSupabaseAdmin();
     if (supabase) {
-      const cardId = textValue(req.body?.card_id) || null;
+      const requestedCardId = textValue(req.body?.card_id) || null;
+      const cardId = await resolveRequestedCardIdForPhone(vendedorId, phone, requestedCardId);
       const payload = {
         vendedor_id: vendedorId,
         card_id: cardId,
@@ -521,10 +709,14 @@ app.post("/message/send", async (req, res) => {
         intervention: false,
       };
 
-      if (externalId) {
-        await supabase.from("whatsapp_messages").upsert(payload, { onConflict: "vendedor_id,external_id" });
-      } else {
-        await supabase.from("whatsapp_messages").insert(payload);
+      if (cardId) {
+        if (externalId) {
+          const { error } = await supabase.from("whatsapp_messages").upsert(payload, { onConflict: "vendedor_id,external_id" });
+          if (error) throw error;
+        } else {
+          const { error } = await supabase.from("whatsapp_messages").insert(payload);
+          if (error) throw error;
+        }
       }
     }
 
@@ -556,7 +748,25 @@ app.post("/history/sync", async (req, res) => {
   }
 });
 
-app.listen(port, async () => {
+const server = app.listen(port, async () => {
   await fs.mkdir(path.resolve(sessionRoot), { recursive: true });
   logger.info({ port, sessionRoot }, "whatsapp-baileys-service started");
 });
+
+async function shutdown(signal: string) {
+  logger.info({ signal }, "shutting down whatsapp-baileys-service");
+  server.close(async () => {
+    try {
+      await stopAllSessions(`shutdown:${signal}`);
+      process.exit(0);
+    } catch (error) {
+      logger.error({ error }, "failed to stop sessions during shutdown");
+      process.exit(1);
+    }
+  });
+
+  setTimeout(() => process.exit(1), 15000).unref();
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));

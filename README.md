@@ -7,8 +7,9 @@ Service to run WhatsApp sessions with Baileys for CRM integrations.
 - Multi-session by `vendedor_id`
 - QR generation and connection status
 - Send outbound messages
-- Inbound message capture and optional persistence in Supabase
+- Inbound message capture with Supabase persistence only for active card links
 - History sync endpoint (`/history/sync`) using WA Web fetch
+- Session reset/logout with auth-state cleanup for stale QR sessions
 
 ## Endpoints
 
@@ -16,6 +17,8 @@ Service to run WhatsApp sessions with Baileys for CRM integrations.
 - `GET /session/status?vendedor_id=<uuid>`
 - `POST /session/refresh-qr`
 - `POST /session/disconnect`
+- `POST /session/reset`
+- `POST /session/logout`
 - `POST /message/send`
 - `POST /history/sync`
 
@@ -25,6 +28,10 @@ Header options:
 
 - `Authorization: Bearer <API_TOKEN>`
 - `x-api-key: <API_TOKEN>`
+- `x-vendedor-id: <vendedor_id>`
+- `x-instance-name: <instance_name>` (optional, must match the service-generated instance name)
+
+Messages are persisted in `whatsapp_messages` only when the phone has an active row in `whatsapp_card_active_links` for the same `vendedor_id`. Unlinked inbound/history messages are ignored by persistence.
 
 ## Request examples
 
@@ -55,6 +62,7 @@ curl -X POST "http://localhost:3000/message/send" \
 Copy `.env.example` to `.env` and set values.
 
 - `PORT` (default `3000`)
+- `NODE_ENV` (recommended `production`)
 - `LOG_LEVEL` (default `info`)
 - `API_TOKEN` (recommended)
 - `BAILEYS_SESSION_DIR` (default `/data/sessions`)
@@ -82,3 +90,5 @@ npm run start
 2. Add persistent storage mounted to `/data`
 3. Set env vars in Coolify
 4. Use `/health` as healthcheck
+5. Keep exactly one replica unless session storage and websocket ownership are redesigned
+6. Configure `API_TOKEN`; without it, private endpoints are intentionally open for local development
