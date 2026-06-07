@@ -117,7 +117,15 @@ function textValue(value: unknown) {
 }
 
 function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error || "Unknown error");
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object") {
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error || "Unknown error");
 }
 
 function timeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
@@ -456,7 +464,22 @@ async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   };
 
   if (externalId) {
-    const { error } = await supabase.from("whatsapp_messages").upsert(payload, { onConflict: "vendedor_id,external_id" });
+    const { data: existing, error: findError } = await supabase
+      .from("whatsapp_messages")
+      .select("id")
+      .eq("vendedor_id", vendedorId)
+      .eq("external_id", externalId)
+      .maybeSingle();
+
+    if (findError) throw findError;
+
+    if (existing?.id) {
+      const { error } = await supabase.from("whatsapp_messages").update(payload).eq("id", existing.id);
+      if (error) throw error;
+      return true;
+    }
+
+    const { error } = await supabase.from("whatsapp_messages").insert(payload);
     if (error) throw error;
   } else {
     const { error } = await supabase.from("whatsapp_messages").insert(payload);
