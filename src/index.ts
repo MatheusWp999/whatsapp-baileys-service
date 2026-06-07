@@ -28,6 +28,13 @@ interface SessionState {
   manualDisconnect: boolean;
   generation: number;
   reconnectTimer: NodeJS.Timeout | null;
+  messagesReceived: number;
+  messagesStored: number;
+  messagesForwarded: number;
+  messageErrors: number;
+  lastMessageAt: string | null;
+  lastMessagePhone: string | null;
+  lastPersistError: string | null;
 }
 
 interface HistorySyncInput {
@@ -109,6 +116,10 @@ function textValue(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error || "Unknown error");
+}
+
 function timeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([
     promise,
@@ -130,6 +141,13 @@ function ensureSessionState(vendedorId: string): SessionState {
     manualDisconnect: false,
     generation: 0,
     reconnectTimer: null,
+    messagesReceived: 0,
+    messagesStored: 0,
+    messagesForwarded: 0,
+    messageErrors: 0,
+    lastMessageAt: null,
+    lastMessagePhone: null,
+    lastPersistError: null,
   };
 
   sessions.set(vendedorId, created);
@@ -148,6 +166,15 @@ function sessionStatusPayload(state: SessionState) {
     inbound_webhook_configured: isInboundWebhookConfigured(),
     linked_retention_days: linkedRetentionDays,
     unlinked_retention_hours: unlinkedRetentionHours,
+    message_metrics: {
+      received: state.messagesReceived,
+      stored: state.messagesStored,
+      forwarded: state.messagesForwarded,
+      errors: state.messageErrors,
+      last_message_at: state.lastMessageAt,
+      last_message_phone: state.lastMessagePhone,
+      last_persist_error: state.lastPersistError,
+    },
   };
 }
 
@@ -394,6 +421,11 @@ function contactPhoneFromJid(remoteJid: string) {
   return normalizePhone((remoteJid.split("@")[0] || remoteJid || "").trim());
 }
 
+function contactPhoneFromMessage(item: proto.IWebMessageInfo) {
+  const remoteJid = item.key?.remoteJid || "";
+  return contactPhoneFromJid(remoteJid);
+}
+
 async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   const supabase = getSupabaseAdmin();
   if (!supabase) return false;
@@ -624,13 +656,27 @@ async function startSession(vendedorId: string, forceRestart = false) {
       try {
         for (const message of payload.messages || []) {
           if (!message?.message) continue;
-          const results = await Promise.allSettled([
+          state.messagesReceived += 1;
+          state.lastMessageAt = new Date().toISOString();
+          state.lastMessagePhone = contactPhoneFromMessage(message) || state.lastMessagePhone;
+
+          const [storeResult, webhookResult] = await Promise.allSettled([
             storeMessage(vendedorId, message),
             forwardInboundMessageToWebhook(vendedorId, message),
           ]);
 
-          for (const result of results) {
+          if (storeResult.status === "fulfilled" && storeResult.value === true) {
+            state.messagesStored += 1;
+          }
+
+          if (webhookResult.status === "fulfilled" && webhookResult.value === true) {
+            state.messagesForwarded += 1;
+          }
+
+          for (const result of [storeResult, webhookResult]) {
             if (result.status === "rejected") {
+              state.messageErrors += 1;
+              state.lastPersistError = errorMessage(result.reason);
               logger.error({ error: result.reason, vendedorId }, "failed to persist inbound whatsapp message");
             }
           }
@@ -759,6 +805,18 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
+  const metrics = Array.from(sessions.values()).map((state) => ({
+    vendedor_id: state.vendedorId,
+    status: state.status,
+    received: state.messagesReceived,
+    stored: state.messagesStored,
+    forwarded: state.messagesForwarded,
+    errors: state.messageErrors,
+    last_message_at: state.lastMessageAt,
+    last_message_phone: state.lastMessagePhone,
+    last_persist_error: state.lastPersistError,
+  }));
+
   res.json({
     ok: true,
     service: "whatsapp-baileys-service",
@@ -766,6 +824,7 @@ app.get("/health", (_req, res) => {
     inbound_webhook_configured: isInboundWebhookConfigured(),
     linked_retention_days: linkedRetentionDays,
     unlinked_retention_hours: unlinkedRetentionHours,
+    sessions: metrics,
     ts: new Date().toISOString(),
   });
 });
