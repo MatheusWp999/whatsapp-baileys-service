@@ -41,6 +41,11 @@ interface ActiveCardLink {
   contact_phone: string | null;
 }
 
+interface CardPhoneMatch {
+  id: string;
+  telefone: string | null;
+}
+
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const app = express();
 
@@ -66,6 +71,10 @@ function getSupabaseAdmin() {
 
   supabaseAdmin = createClient(url, key);
   return supabaseAdmin;
+}
+
+function isSupabaseConfigured() {
+  return !!(process.env.SUPABASE_URL || "").trim() && !!(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 }
 
 function normalizePhone(phone: string) {
@@ -121,6 +130,7 @@ function sessionStatusPayload(state: SessionState) {
     connected: state.status === "connected",
     qr_raw: state.qrRaw,
     last_error: state.lastError,
+    supabase_configured: isSupabaseConfigured(),
   };
 }
 
@@ -280,8 +290,79 @@ async function resolveCardIdForPhone(vendedorId: string, phone: string) {
   return null;
 }
 
+async function resolveUniqueCardIdByPhone(vendedorId: string, phone: string) {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return null;
+
+  const normalized = normalizePhone(phone);
+  if (normalized.length < 8) return null;
+  const last8 = normalized.slice(-8);
+
+  const { data, error } = await supabase
+    .from("cards")
+    .select("id, telefone")
+    .eq("vendedor_id", vendedorId)
+    .not("telefone", "is", null)
+    .limit(1000);
+
+  if (error) {
+    logger.error({ error, vendedorId }, "failed to resolve card by phone");
+    return null;
+  }
+
+  const matches = ((data || []) as CardPhoneMatch[]).filter((row) => {
+    const cardPhone = normalizePhone(row.telefone || "");
+    if (cardPhone.length < 8) return false;
+    return cardPhone.endsWith(last8) || normalized.endsWith(cardPhone.slice(-8));
+  });
+
+  if (matches.length !== 1) {
+    if (matches.length > 1) {
+      logger.warn({ vendedorId, phone: normalized, matches: matches.length }, "multiple cards matched whatsapp phone; message not auto-linked");
+    }
+    return null;
+  }
+
+  return matches[0].id;
+}
+
+async function ensureActiveCardLinkForPhone(vendedorId: string, phone: string) {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return null;
+
+  const existingCardId = await resolveCardIdForPhone(vendedorId, phone);
+  if (existingCardId) return existingCardId;
+
+  const cardId = await resolveUniqueCardIdByPhone(vendedorId, phone);
+  if (!cardId) return null;
+
+  const normalized = normalizePhone(phone);
+  const { error } = await supabase.from("whatsapp_card_active_links").upsert(
+    {
+      card_id: cardId,
+      vendedor_id: vendedorId,
+      contact_phone: normalized,
+      active: true,
+      linked_by_user_id: null,
+      linked_by_vendedor_id: vendedorId,
+      linked_at: new Date().toISOString(),
+      unlinked_at: null,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "card_id,vendedor_id" },
+  );
+
+  if (error) {
+    logger.error({ error, vendedorId, cardId }, "failed to auto-link whatsapp phone to card");
+    return null;
+  }
+
+  logger.info({ vendedorId, cardId, phone: normalized }, "auto-linked whatsapp phone to card");
+  return cardId;
+}
+
 async function resolveRequestedCardIdForPhone(vendedorId: string, phone: string, requestedCardId: string | null) {
-  const linkedCardId = await resolveCardIdForPhone(vendedorId, phone);
+  const linkedCardId = await ensureActiveCardLinkForPhone(vendedorId, phone);
   if (!linkedCardId) return null;
   if (requestedCardId && requestedCardId !== linkedCardId) return null;
   return requestedCardId || linkedCardId;
@@ -310,7 +391,7 @@ async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   const externalId = textValue(key?.id);
   const createdAt = messageTimestampToIso(item.messageTimestamp) || new Date().toISOString();
   const messageType = content === "[media]" ? "media" : "text";
-  const cardId = await resolveCardIdForPhone(vendedorId, contactPhone);
+  const cardId = await ensureActiveCardLinkForPhone(vendedorId, contactPhone);
   if (!cardId) return false;
 
   const payload = {
@@ -578,7 +659,7 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "whatsapp-baileys-service", ts: new Date().toISOString() });
+  res.json({ ok: true, service: "whatsapp-baileys-service", supabase_configured: isSupabaseConfigured(), ts: new Date().toISOString() });
 });
 
 app.use(authMiddleware);
