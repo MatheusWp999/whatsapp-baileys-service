@@ -52,6 +52,8 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const sessionRoot = process.env.BAILEYS_SESSION_DIR || "/data/sessions";
 const apiToken = (process.env.API_TOKEN || "").trim();
+const linkedRetentionDays = Number(process.env.WHATSAPP_LINKED_RETENTION_DAYS || 90);
+const unlinkedRetentionHours = Number(process.env.WHATSAPP_UNLINKED_RETENTION_HOURS || 24);
 
 const sessions = new Map<string, SessionState>();
 
@@ -75,6 +77,12 @@ function getSupabaseAdmin() {
 
 function isSupabaseConfigured() {
   return !!(process.env.SUPABASE_URL || "").trim() && !!(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+}
+
+function retentionCutoffIso(amount: number, unit: "days" | "hours") {
+  const safeAmount = Number.isFinite(amount) && amount > 0 ? amount : unit === "days" ? 90 : 24;
+  const ms = unit === "days" ? safeAmount * 24 * 60 * 60 * 1000 : safeAmount * 60 * 60 * 1000;
+  return new Date(Date.now() - ms).toISOString();
 }
 
 function normalizePhone(phone: string) {
@@ -131,6 +139,8 @@ function sessionStatusPayload(state: SessionState) {
     qr_raw: state.qrRaw,
     last_error: state.lastError,
     supabase_configured: isSupabaseConfigured(),
+    linked_retention_days: linkedRetentionDays,
+    unlinked_retention_hours: unlinkedRetentionHours,
   };
 }
 
@@ -392,7 +402,6 @@ async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   const createdAt = messageTimestampToIso(item.messageTimestamp) || new Date().toISOString();
   const messageType = content === "[media]" ? "media" : "text";
   const cardId = await ensureActiveCardLinkForPhone(vendedorId, contactPhone);
-  if (!cardId) return false;
 
   const payload = {
     vendedor_id: vendedorId,
@@ -416,6 +425,39 @@ async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   }
 
   return true;
+}
+
+async function cleanupExpiredMessages() {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return;
+
+  const linkedCutoff = retentionCutoffIso(linkedRetentionDays, "days");
+  const unlinkedCutoff = retentionCutoffIso(unlinkedRetentionHours, "hours");
+
+  const { error: linkedError } = await supabase
+    .from("whatsapp_messages")
+    .delete()
+    .not("card_id", "is", null)
+    .lt("created_at", linkedCutoff);
+
+  if (linkedError) {
+    logger.error({ error: linkedError }, "failed to clean linked whatsapp messages");
+  }
+
+  const { error: unlinkedError } = await supabase
+    .from("whatsapp_messages")
+    .delete()
+    .is("card_id", null)
+    .lt("created_at", unlinkedCutoff);
+
+  if (unlinkedError) {
+    logger.error({ error: unlinkedError }, "failed to clean unlinked whatsapp messages");
+  }
+}
+
+function startRetentionCleanup() {
+  void cleanupExpiredMessages();
+  return setInterval(() => void cleanupExpiredMessages(), 60 * 60 * 1000);
 }
 
 async function scheduleReconnect(vendedorId: string, delayMs = 2500) {
@@ -659,7 +701,14 @@ app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "whatsapp-baileys-service", supabase_configured: isSupabaseConfigured(), ts: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: "whatsapp-baileys-service",
+    supabase_configured: isSupabaseConfigured(),
+    linked_retention_days: linkedRetentionDays,
+    unlinked_retention_hours: unlinkedRetentionHours,
+    ts: new Date().toISOString(),
+  });
 });
 
 app.use(authMiddleware);
@@ -829,6 +878,8 @@ app.post("/history/sync", async (req, res) => {
   }
 });
 
+const retentionCleanupTimer = startRetentionCleanup();
+
 const server = app.listen(port, async () => {
   await fs.mkdir(path.resolve(sessionRoot), { recursive: true });
   logger.info({ port, sessionRoot }, "whatsapp-baileys-service started");
@@ -836,6 +887,7 @@ const server = app.listen(port, async () => {
 
 async function shutdown(signal: string) {
   logger.info({ signal }, "shutting down whatsapp-baileys-service");
+  clearInterval(retentionCleanupTimer);
   server.close(async () => {
     try {
       await stopAllSessions(`shutdown:${signal}`);
