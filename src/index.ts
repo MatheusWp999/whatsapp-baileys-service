@@ -54,6 +54,8 @@ const sessionRoot = process.env.BAILEYS_SESSION_DIR || "/data/sessions";
 const apiToken = (process.env.API_TOKEN || "").trim();
 const linkedRetentionDays = Number(process.env.WHATSAPP_LINKED_RETENTION_DAYS || 90);
 const unlinkedRetentionHours = Number(process.env.WHATSAPP_UNLINKED_RETENTION_HOURS || 24);
+const inboundWebhookUrl = (process.env.WHATSAPP_INBOUND_WEBHOOK_URL || process.env.WEBHOOK_URL || "").trim();
+const inboundWebhookSecret = (process.env.WHATSAPP_INBOUND_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || apiToken).trim();
 
 const sessions = new Map<string, SessionState>();
 
@@ -77,6 +79,10 @@ function getSupabaseAdmin() {
 
 function isSupabaseConfigured() {
   return !!(process.env.SUPABASE_URL || "").trim() && !!(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+}
+
+function isInboundWebhookConfigured() {
+  return !!inboundWebhookUrl;
 }
 
 function retentionCutoffIso(amount: number, unit: "days" | "hours") {
@@ -139,6 +145,7 @@ function sessionStatusPayload(state: SessionState) {
     qr_raw: state.qrRaw,
     last_error: state.lastError,
     supabase_configured: isSupabaseConfigured(),
+    inbound_webhook_configured: isInboundWebhookConfigured(),
     linked_retention_days: linkedRetentionDays,
     unlinked_retention_hours: unlinkedRetentionHours,
   };
@@ -427,6 +434,48 @@ async function storeMessage(vendedorId: string, item: proto.IWebMessageInfo) {
   return true;
 }
 
+async function forwardInboundMessageToWebhook(vendedorId: string, item: proto.IWebMessageInfo) {
+  if (!inboundWebhookUrl) return false;
+
+  const payload = {
+    vendedor_id: vendedorId,
+    instance_name: buildInstanceName(vendedorId),
+    messages: [
+      {
+        key: item.key,
+        message: item.message,
+        messageTimestamp: item.messageTimestamp ? String(item.messageTimestamp) : undefined,
+        pushName: item.pushName || "",
+      },
+    ],
+  };
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-vendedor-id": vendedorId,
+    "x-instance-name": buildInstanceName(vendedorId),
+  };
+
+  if (inboundWebhookSecret) {
+    headers.Authorization = `Bearer ${inboundWebhookSecret}`;
+    headers["x-api-key"] = inboundWebhookSecret;
+    headers["x-baileys-webhook-secret"] = inboundWebhookSecret;
+  }
+
+  const response = await fetch(inboundWebhookUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Inbound webhook failed (${response.status}): ${body.slice(0, 500)}`);
+  }
+
+  return true;
+}
+
 async function cleanupExpiredMessages() {
   const supabase = getSupabaseAdmin();
   if (!supabase) return;
@@ -575,7 +624,16 @@ async function startSession(vendedorId: string, forceRestart = false) {
       try {
         for (const message of payload.messages || []) {
           if (!message?.message) continue;
-          await storeMessage(vendedorId, message);
+          const results = await Promise.allSettled([
+            storeMessage(vendedorId, message),
+            forwardInboundMessageToWebhook(vendedorId, message),
+          ]);
+
+          for (const result of results) {
+            if (result.status === "rejected") {
+              logger.error({ error: result.reason, vendedorId }, "failed to persist inbound whatsapp message");
+            }
+          }
         }
       } catch (error) {
         logger.error({ error, vendedorId }, "failed to store messages.upsert");
@@ -705,6 +763,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "whatsapp-baileys-service",
     supabase_configured: isSupabaseConfigured(),
+    inbound_webhook_configured: isInboundWebhookConfigured(),
     linked_retention_days: linkedRetentionDays,
     unlinked_retention_hours: unlinkedRetentionHours,
     ts: new Date().toISOString(),

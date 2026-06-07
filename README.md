@@ -33,6 +33,8 @@ Header options:
 
 All direct inbound/outbound messages are written to `whatsapp_messages` so they can appear in the CRM while the session is connected. When a phone matches exactly one card for the same `vendedor_id`, the service auto-creates an active link in `whatsapp_card_active_links` and saves the message with `card_id`.
 
+Inbound messages can be persisted directly with `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` and can also be forwarded to the CRM Edge Function using `WHATSAPP_INBOUND_WEBHOOK_URL`. Configure at least one of these paths in production; using both is safe because messages with provider ids are upserted.
+
 Retention is enforced by the service:
 
 - Linked messages (`card_id IS NOT NULL`) are kept for `WHATSAPP_LINKED_RETENTION_DAYS` days, default `90`.
@@ -74,6 +76,8 @@ Copy `.env.example` to `.env` and set values.
 - `BAILEYS_INSTANCE_PREFIX` (default `crm-`)
 - `SUPABASE_URL` (optional)
 - `SUPABASE_SERVICE_ROLE_KEY` (optional)
+- `WHATSAPP_INBOUND_WEBHOOK_URL` (optional, CRM Edge Function webhook URL)
+- `WHATSAPP_INBOUND_WEBHOOK_SECRET` (optional, defaults to `API_TOKEN`)
 - `WHATSAPP_LINKED_RETENTION_DAYS` (default `90`)
 - `WHATSAPP_UNLINKED_RETENTION_HOURS` (default `24`)
 
