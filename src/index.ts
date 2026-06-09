@@ -801,7 +801,8 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
   return res.status(401).json({ error: "Unauthorized" });
 }
 
-function requireVendedorId(req: Request, res: Response) {
+function requireVendedorId(req: Request, res: Response, options: { validateInstanceName?: boolean } = {}) {
+  const validateInstanceName = options.validateInstanceName !== false;
   const vendedorId = textValue(req.query.vendedor_id) || textValue(req.body?.vendedor_id) || textValue(req.headers["x-vendedor-id"]);
   if (!vendedorId) {
     res.status(400).json({ error: "vendedor_id is required" });
@@ -816,7 +817,7 @@ function requireVendedorId(req: Request, res: Response) {
   }
 
   const instanceName = textValue(req.query.instance_name) || textValue(req.body?.instance_name) || textValue(req.headers["x-instance-name"]);
-  if (instanceName && instanceName !== buildInstanceName(vendedorId)) {
+  if (validateInstanceName && instanceName && instanceName !== buildInstanceName(vendedorId)) {
     res.status(400).json({ error: "instance_name does not match vendedor_id" });
     return null;
   }
@@ -937,7 +938,7 @@ app.post("/session/logout", async (req, res) => {
 
 app.post("/message/send", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res);
+    const vendedorId = requireVendedorId(req, res, { validateInstanceName: false });
     if (!vendedorId) return;
 
     const phone = normalizePhone(textValue(req.body?.phone) || textValue(req.body?.contact_phone));
