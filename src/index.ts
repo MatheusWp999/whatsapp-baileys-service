@@ -825,7 +825,7 @@ function requireVendedorId(req: Request, res: Response) {
 }
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 app.get("/health", (_req, res) => {
   const metrics = Array.from(sessions.values()).map((state) => ({
@@ -942,12 +942,20 @@ app.post("/message/send", async (req, res) => {
 
     const phone = normalizePhone(textValue(req.body?.phone) || textValue(req.body?.contact_phone));
     const text = textValue(req.body?.text) || textValue(req.body?.content);
+    const attachment = req.body?.attachment && typeof req.body.attachment === "object" ? req.body.attachment : null;
+    const attachmentBase64 = textValue(attachment?.base64);
+    const attachmentFileName = textValue(attachment?.file_name) || textValue(attachment?.fileName) || "via-de-venda.pdf";
+    const attachmentMimeType = textValue(attachment?.mime_type) || textValue(attachment?.mimeType) || "application/pdf";
     if (!phone || phone.length < 8) {
       res.status(400).json({ error: "phone is invalid" });
       return;
     }
     if (!text) {
       res.status(400).json({ error: "text is required" });
+      return;
+    }
+    if (attachmentBase64 && attachmentMimeType !== "application/pdf") {
+      res.status(400).json({ error: "attachment mime type is invalid" });
       return;
     }
 
@@ -958,7 +966,14 @@ app.post("/message/send", async (req, res) => {
     }
 
     const jid = `${phone}@s.whatsapp.net`;
-    const result = await state.sock.sendMessage(jid, { text });
+    const result = attachmentBase64
+      ? await state.sock.sendMessage(jid, {
+          document: Buffer.from(attachmentBase64, "base64"),
+          fileName: attachmentFileName,
+          mimetype: attachmentMimeType,
+          caption: text,
+        })
+      : await state.sock.sendMessage(jid, { text });
 
     const externalId = textValue((result as any)?.key?.id) || null;
     const supabase = getSupabaseAdmin();
@@ -973,7 +988,7 @@ app.post("/message/send", async (req, res) => {
         contact_name: "",
         direction: "out",
         content: text,
-        message_type: "text",
+        message_type: attachmentBase64 ? "document" : "text",
         external_id: externalId,
         sent_by_user_id: null,
         sent_as_vendedor_id: vendedorId,
