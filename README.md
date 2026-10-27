@@ -8,7 +8,8 @@ Service to run WhatsApp sessions with Baileys for CRM integrations.
 - QR generation and connection status
 - Send outbound messages
 - Inbound message capture for CRM visibility
-- History sync endpoint (`/history/sync`) using WA Web fetch
+- Automatic chat and message history from Baileys `messaging-history.set`
+- Durable conversation projection in `whatsapp_chats`
 - Session reset/logout with auth-state cleanup for stale QR sessions
 
 ## Endpoints
@@ -20,9 +21,10 @@ Service to run WhatsApp sessions with Baileys for CRM integrations.
 - `POST /session/reset`
 - `POST /session/logout`
 - `POST /message/send`
+- `POST /chat/read`
 - `POST /history/sync`
 
-All endpoints except `/health` require auth when `API_TOKEN` is configured.
+All endpoints except `/health` require `API_TOKEN` authentication.
 
 Header options:
 
@@ -31,14 +33,14 @@ Header options:
 - `x-vendedor-id: <vendedor_id>`
 - `x-instance-name: <instance_name>` (optional, must match the service-generated instance name)
 
-All direct inbound/outbound messages are written to `whatsapp_messages` so they can appear in the CRM while the session is connected. When a phone matches exactly one card for the same `vendedor_id`, the service auto-creates an active link in `whatsapp_card_active_links` and saves the message with `card_id`.
-
-Inbound messages can be persisted directly with `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` and can also be forwarded to the CRM Edge Function using `WHATSAPP_INBOUND_WEBHOOK_URL`. Configure at least one of these paths in production; using both is safe because messages with provider ids are upserted.
+Chats and direct inbound/outbound messages are written to `whatsapp_chats` and `whatsapp_messages`. Initial history is persisted when Baileys emits `messaging-history.set`. When a phone matches exactly one card for the same `vendedor_id`, live messages can be linked automatically to the card.
 
 Retention is enforced by the service:
 
 - Linked messages (`card_id IS NOT NULL`) are kept for `WHATSAPP_LINKED_RETENTION_DAYS` days, default `90`.
-- Unlinked messages (`card_id IS NULL`) are temporary and kept for `WHATSAPP_UNLINKED_RETENTION_HOURS` hours, default `24`, so they can appear in the CRM and be linked to a card.
+- Unlinked messages (`card_id IS NULL`) are kept for `WHATSAPP_UNLINKED_RETENTION_DAYS` days, default `90`.
+- Empty chat projections older than the longest configured retention period are removed.
+- Stored media follows the message retention policy and remains private in `whatsapp-media`.
 
 ## Request examples
 
@@ -71,15 +73,14 @@ Copy `.env.example` to `.env` and set values.
 - `PORT` (default `3000`)
 - `NODE_ENV` (recommended `production`)
 - `LOG_LEVEL` (default `info`)
-- `API_TOKEN` (recommended)
+- `API_TOKEN` (required)
 - `BAILEYS_SESSION_DIR` (default `/data/sessions`)
 - `BAILEYS_INSTANCE_PREFIX` (default `crm-`)
-- `SUPABASE_URL` (optional)
-- `SUPABASE_SERVICE_ROLE_KEY` (optional)
-- `WHATSAPP_INBOUND_WEBHOOK_URL` (optional, CRM Edge Function webhook URL)
-- `WHATSAPP_INBOUND_WEBHOOK_SECRET` (optional, defaults to `API_TOKEN`)
+- `SUPABASE_URL` (required)
+- `SUPABASE_SERVICE_ROLE_KEY` (required)
 - `WHATSAPP_LINKED_RETENTION_DAYS` (default `90`)
-- `WHATSAPP_UNLINKED_RETENTION_HOURS` (default `24`)
+- `WHATSAPP_UNLINKED_RETENTION_DAYS` (default `90`)
+- `WHATSAPP_MEDIA_MAX_BYTES` (default `15000000`)
 
 ## Run locally
 
@@ -102,4 +103,4 @@ npm run start
 3. Set env vars in Coolify
 4. Use `/health` as healthcheck
 5. Keep exactly one replica unless session storage and websocket ownership are redesigned
-6. Configure `API_TOKEN`; without it, private endpoints are intentionally open for local development
+6. Configure `API_TOKEN`, `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`

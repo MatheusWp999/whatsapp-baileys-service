@@ -2,6 +2,10 @@ FROM node:20-alpine AS deps
 
 WORKDIR /app
 
+RUN apk add --no-cache git openssh-client \
+    && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+
 COPY package*.json ./
 RUN npm ci
 
@@ -18,6 +22,10 @@ FROM node:20-alpine AS runtime
 
 WORKDIR /app
 ENV NODE_ENV=production
+
+RUN apk add --no-cache git openssh-client \
+    && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+    && git config --global --add url."https://github.com/".insteadOf "git@github.com:"
 
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
