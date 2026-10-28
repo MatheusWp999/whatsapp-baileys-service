@@ -19,6 +19,8 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { mediaTypeFromMime, sendWhatsAppMessage } from "./messageTransport.js";
+import { deriveOutboundMime } from "./outboundMedia.js";
 import {
   canonicalJid,
   contactPhoneFromJid,
@@ -33,7 +35,8 @@ import {
 type SessionStatus = "disconnected" | "connecting" | "qrcode" | "connected";
 
 interface SessionState {
-  vendedorId: string;
+  accountId: string;
+  ownerVendedorId: string;
   sock: WASocket | null;
   status: SessionStatus;
   qrRaw: string | null;
@@ -74,6 +77,27 @@ interface CardPhoneMatch {
   telefone: string | null;
 }
 
+interface WhatsAppAccount {
+  id: string;
+  ownerVendedorId: string;
+  active: boolean;
+}
+
+interface OutboundJob {
+  id: string;
+  campaign_id: string;
+  account_id: string;
+  owner_vendedor_id: string;
+  contact_phone: string;
+  contact_name: string | null;
+  content: string | null;
+  boleto_id: string | null;
+  storage_path: string | null;
+  file_name: string | null;
+  card_id: string | null;
+  created_by_user_id: string | null;
+}
+
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const app = express();
 
@@ -86,7 +110,14 @@ const unlinkedRetentionDays = Number(
   process.env.WHATSAPP_UNLINKED_RETENTION_DAYS ||
   (legacyUnlinkedRetentionHours > 0 ? legacyUnlinkedRetentionHours / 24 : linkedRetentionDays || 90),
 );
-const mediaMaxBytes = Number(process.env.WHATSAPP_MEDIA_MAX_BYTES || 15_000_000);
+const configuredMediaMaxBytes = Number(process.env.WHATSAPP_MEDIA_MAX_BYTES || 15_000_000);
+const mediaMaxBytes = Number.isFinite(configuredMediaMaxBytes) && configuredMediaMaxBytes > 0
+  ? configuredMediaMaxBytes
+  : 15_000_000;
+const campaignWorkerEnabled = (process.env.WHATSAPP_CAMPAIGN_WORKER_ENABLED || "").trim().toLowerCase() === "true";
+const configuredCampaignPollMs = Number(process.env.WHATSAPP_CAMPAIGN_POLL_MS || 2000);
+const campaignPollMs = Number.isFinite(configuredCampaignPollMs) ? Math.max(250, configuredCampaignPollMs) : 2000;
+const workerId = `${process.env.HOSTNAME || "whatsapp"}-${process.pid}-${randomUUID()}`;
 
 if (!process.env.WHATSAPP_UNLINKED_RETENTION_DAYS && legacyUnlinkedRetentionHours > 0) {
   logger.warn("WHATSAPP_UNLINKED_RETENTION_HOURS is deprecated; configure WHATSAPP_UNLINKED_RETENTION_DAYS");
@@ -164,12 +195,16 @@ function timeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   ]);
 }
 
-function ensureSessionState(vendedorId: string): SessionState {
-  const existing = sessions.get(vendedorId);
-  if (existing) return existing;
+function ensureSessionState(account: WhatsAppAccount): SessionState {
+  const existing = sessions.get(account.id);
+  if (existing) {
+    existing.ownerVendedorId = account.ownerVendedorId;
+    return existing;
+  }
 
   const created: SessionState = {
-    vendedorId,
+    accountId: account.id,
+    ownerVendedorId: account.ownerVendedorId,
     sock: null,
     status: "disconnected",
     qrRaw: null,
@@ -200,14 +235,15 @@ function ensureSessionState(vendedorId: string): SessionState {
     historyReadyTimer: null,
   };
 
-  sessions.set(vendedorId, created);
+  sessions.set(account.id, created);
   return created;
 }
 
 function sessionStatusPayload(state: SessionState) {
   return {
-    vendedor_id: state.vendedorId,
-    instance_name: buildInstanceName(state.vendedorId),
+    account_id: state.accountId,
+    vendedor_id: state.ownerVendedorId,
+    instance_name: buildInstanceName(state.accountId),
     status: state.status,
     connected: state.status === "connected",
     qr_raw: state.qrRaw,
@@ -241,13 +277,14 @@ async function updateConnectionRow(state: SessionState) {
   const supabase = getSupabaseAdmin();
   if (!supabase) return;
 
-  const instanceName = buildInstanceName(state.vendedorId);
+  const instanceName = buildInstanceName(state.accountId);
 
   const { error } = await supabase
     .from("whatsapp_connections")
     .upsert(
       {
-        vendedor_id: state.vendedorId,
+      account_id: state.accountId,
+      vendedor_id: state.ownerVendedorId,
         instance_name: instanceName,
         status: state.status,
         initial_sync_state: state.historyState,
@@ -255,9 +292,23 @@ async function updateConnectionRow(state: SessionState) {
         initial_sync_error: state.historyError,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: "vendedor_id" },
+      { onConflict: "account_id" },
     );
   if (error) throw error;
+}
+
+async function resolveAccount(accountId: string): Promise<WhatsAppAccount> {
+  assertValidVendedorId(accountId);
+  const supabase = getSupabaseAdmin();
+  if (!supabase) throw new Error("Supabase persistence is required");
+  const { data, error } = await supabase
+    .from("whatsapp_accounts")
+    .select("id, owner_vendedor_id, active")
+    .eq("id", accountId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data?.id || !data.owner_vendedor_id) throw new Error("WhatsApp account was not found");
+  return { id: data.id, ownerVendedorId: data.owner_vendedor_id, active: data.active !== false };
 }
 
 async function loadConnectionHistoryState(state: SessionState) {
@@ -266,7 +317,7 @@ async function loadConnectionHistoryState(state: SessionState) {
   const { data, error } = await supabase
     .from("whatsapp_connections")
     .select("initial_sync_state, initial_sync_completed_at, initial_sync_error")
-    .eq("vendedor_id", state.vendedorId)
+    .eq("account_id", state.accountId)
     .maybeSingle();
   if (error) throw error;
   const syncState = textValue(data?.initial_sync_state);
@@ -363,18 +414,18 @@ function extractMessageText(msg: proto.IMessage | null | undefined): string {
   return "";
 }
 
-async function resolveCardIdForPhone(vendedorId: string, phone: string) {
+async function resolveCardIdForPhone(state: SessionState, phone: string) {
   const supabase = getSupabaseAdmin();
   if (!supabase) return null;
 
   const { data, error } = await supabase
     .from("whatsapp_card_active_links")
     .select("card_id, contact_phone")
-    .eq("vendedor_id", vendedorId)
+    .eq("account_id", state.accountId)
     .eq("active", true);
 
   if (error) {
-    logger.error({ error, vendedorId }, "failed to resolve active whatsapp card link");
+    logger.error({ error, accountId: state.accountId }, "failed to resolve active whatsapp card link");
     return null;
   }
 
@@ -390,7 +441,7 @@ async function resolveCardIdForPhone(vendedorId: string, phone: string) {
   return null;
 }
 
-async function resolveUniqueCardIdByPhone(vendedorId: string, phone: string) {
+async function resolveUniqueCardIdByPhone(state: SessionState, phone: string) {
   const supabase = getSupabaseAdmin();
   if (!supabase) return null;
 
@@ -401,12 +452,12 @@ async function resolveUniqueCardIdByPhone(vendedorId: string, phone: string) {
   const { data, error } = await supabase
     .from("cards")
     .select("id, telefone")
-    .eq("vendedor_id", vendedorId)
+    .eq("vendedor_id", state.ownerVendedorId)
     .not("telefone", "is", null)
     .limit(1000);
 
   if (error) {
-    logger.error({ error, vendedorId }, "failed to resolve card by phone");
+    logger.error({ error, accountId: state.accountId }, "failed to resolve card by phone");
     return null;
   }
 
@@ -418,7 +469,7 @@ async function resolveUniqueCardIdByPhone(vendedorId: string, phone: string) {
 
   if (matches.length !== 1) {
     if (matches.length > 1) {
-      logger.warn({ vendedorId, phone: normalized, matches: matches.length }, "multiple cards matched whatsapp phone; message not auto-linked");
+      logger.warn({ accountId: state.accountId, phone: normalized, matches: matches.length }, "multiple cards matched whatsapp phone; message not auto-linked");
     }
     return null;
   }
@@ -426,38 +477,39 @@ async function resolveUniqueCardIdByPhone(vendedorId: string, phone: string) {
   return matches[0].id;
 }
 
-async function ensureActiveCardLinkForPhone(vendedorId: string, phone: string) {
+async function ensureActiveCardLinkForPhone(state: SessionState, phone: string) {
   const supabase = getSupabaseAdmin();
   if (!supabase) return null;
 
-  const existingCardId = await resolveCardIdForPhone(vendedorId, phone);
+  const existingCardId = await resolveCardIdForPhone(state, phone);
   if (existingCardId) return existingCardId;
 
-  const cardId = await resolveUniqueCardIdByPhone(vendedorId, phone);
+  const cardId = await resolveUniqueCardIdByPhone(state, phone);
   if (!cardId) return null;
 
   const normalized = normalizePhone(phone);
   const { error } = await supabase.from("whatsapp_card_active_links").upsert(
     {
       card_id: cardId,
-      vendedor_id: vendedorId,
+      account_id: state.accountId,
+      vendedor_id: state.ownerVendedorId,
       contact_phone: normalized,
       active: true,
       linked_by_user_id: null,
-      linked_by_vendedor_id: vendedorId,
+      linked_by_vendedor_id: state.ownerVendedorId,
       linked_at: new Date().toISOString(),
       unlinked_at: null,
       updated_at: new Date().toISOString(),
     },
-    { onConflict: "card_id,vendedor_id" },
+    { onConflict: "card_id,account_id" },
   );
 
   if (error) {
-    logger.error({ error, vendedorId, cardId }, "failed to auto-link whatsapp phone to card");
+    logger.error({ error, accountId: state.accountId, cardId }, "failed to auto-link whatsapp phone to card");
     return null;
   }
 
-  logger.info({ vendedorId, cardId, phone: normalized }, "auto-linked whatsapp phone to card");
+  logger.info({ accountId: state.accountId, cardId, phone: normalized }, "auto-linked whatsapp phone to card");
   return cardId;
 }
 
@@ -551,7 +603,7 @@ async function persistMessageMedia(state: SessionState, item: proto.IWebMessageI
   if (!metadata || !externalId) return null;
   if (!state.sock) throw new Error("WhatsApp session is required to restore queued media");
   if (metadata.declaredSize > mediaMaxBytes) {
-    logger.warn({ vendedorId: state.vendedorId, externalId, size: metadata.declaredSize }, "whatsapp media exceeds storage limit");
+    logger.warn({ accountId: state.accountId, externalId, size: metadata.declaredSize }, "whatsapp media exceeds storage limit");
     return null;
   }
   const mediaStream = await downloadMediaMessage(item as WAMessage, "stream", {}, {
@@ -578,7 +630,7 @@ async function persistMessageMedia(state: SessionState, item: proto.IWebMessageI
       : metadata.mimeType.startsWith("audio/")
         ? ".ogg"
         : ".bin";
-  const objectPath = `${state.vendedorId}/${new Date().toISOString().slice(0, 7)}/${externalId}${extensionFromName || fallbackExtension}`;
+  const objectPath = `${state.accountId}/${new Date().toISOString().slice(0, 7)}/${externalId}${extensionFromName || fallbackExtension}`;
   const supabase = getSupabaseAdmin();
   if (!supabase) throw new Error("Supabase persistence is required for media storage");
   const { error } = await supabase.storage.from("whatsapp-media").upload(objectPath, buffer, {
@@ -607,7 +659,7 @@ function buildContactAliases(contacts: Array<Record<string, unknown>>) {
 }
 
 async function upsertChat(
-  vendedorId: string,
+  state: SessionState,
   remoteJid: string,
   identity: ContactIdentity,
   values: Record<string, unknown>,
@@ -616,19 +668,20 @@ async function upsertChat(
   if (!supabase || !identity.phone) return false;
 
   const payload = {
-    vendedor_id: vendedorId,
+    account_id: state.accountId,
+    vendedor_id: state.ownerVendedorId,
     remote_jid: canonicalJid(remoteJid),
     contact_phone: identity.phone,
     ...(identity.name ? { contact_name: identity.name } : {}),
     ...values,
     updated_at: new Date().toISOString(),
   };
-  const { error } = await supabase.from("whatsapp_chats").upsert(payload, { onConflict: "vendedor_id,remote_jid" });
+  const { error } = await supabase.from("whatsapp_chats").upsert(payload, { onConflict: "account_id,remote_jid" });
   if (error) throw error;
   return true;
 }
 
-async function resolveContactIdentity(vendedorId: string, remoteJid: string, aliases?: ContactAliases) {
+async function resolveContactIdentity(state: SessionState, remoteJid: string, aliases?: ContactAliases) {
   const jid = canonicalJid(remoteJid);
   const alias = aliases?.get(jid);
   if (alias?.phone) return alias;
@@ -642,7 +695,7 @@ async function resolveContactIdentity(vendedorId: string, remoteJid: string, ali
   const { data, error } = await supabase
     .from("whatsapp_chats")
     .select("contact_phone, contact_name")
-    .eq("vendedor_id", vendedorId)
+    .eq("account_id", state.accountId)
     .eq("remote_jid", jid)
     .maybeSingle();
   if (error) throw error;
@@ -656,11 +709,11 @@ async function resolveContactIdentity(vendedorId: string, remoteJid: string, ali
 async function storeMessage(state: SessionState, item: proto.IWebMessageInfo, aliases?: ContactAliases) {
   const supabase = getSupabaseAdmin();
   if (!supabase) return false;
-  const vendedorId = state.vendedorId;
+  const accountId = state.accountId;
 
   const key = item.key;
   const remoteJid = canonicalJid(key?.remoteJid || "");
-  const identity = await resolveContactIdentity(vendedorId, remoteJid, aliases);
+  const identity = await resolveContactIdentity(state, remoteJid, aliases);
   if (!identity?.phone) return false;
   const contactPhone = identity.phone;
   const canonicalConversationJid = conversationJid(remoteJid, contactPhone);
@@ -670,20 +723,21 @@ async function storeMessage(state: SessionState, item: proto.IWebMessageInfo, al
   const direction = key?.fromMe ? "out" : "in";
   const externalId = textValue(key?.id);
   const createdAt = messageTimestampToIso(item.messageTimestamp) || new Date().toISOString();
-  const cardId = await ensureActiveCardLinkForPhone(vendedorId, contactPhone);
+  const cardId = await ensureActiveCardLinkForPhone(state, contactPhone);
   const contactName = textValue(item.pushName) || identity.name || "";
   if (externalId && mediaMetadata(item) && !state.sock) {
     throw new Error("WhatsApp session is required to restore queued media");
   }
   const storedMedia = externalId
     ? await persistMessageMedia(state, item, externalId).catch((error) => {
-        logger.warn({ error, vendedorId, externalId }, "failed to persist whatsapp media; storing message metadata only");
+        logger.warn({ error, accountId, externalId }, "failed to persist whatsapp media; storing message metadata only");
         return null;
       })
     : null;
 
   const payload = {
-    vendedor_id: vendedorId,
+    account_id: accountId,
+    vendedor_id: state.ownerVendedorId,
     ...(cardId ? { card_id: cardId } : {}),
     remote_jid: canonicalConversationJid,
     source_remote_jid: remoteJid,
@@ -704,14 +758,14 @@ async function storeMessage(state: SessionState, item: proto.IWebMessageInfo, al
   };
 
   if (externalId) {
-    const { error } = await supabase.from("whatsapp_messages").upsert(payload, { onConflict: "vendedor_id,external_id" });
+    const { error } = await supabase.from("whatsapp_messages").upsert(payload, { onConflict: "account_id,external_id" });
     if (error) throw error;
   } else {
     const { error } = await supabase.from("whatsapp_messages").insert(payload);
     if (error) throw error;
   }
 
-  await upsertChat(vendedorId, canonicalConversationJid, { phone: contactPhone, name: contactName }, {
+  await upsertChat(state, canonicalConversationJid, { phone: contactPhone, name: contactName }, {
     last_message_at: createdAt,
     last_message_preview: content,
     last_message_direction: direction,
@@ -720,7 +774,7 @@ async function storeMessage(state: SessionState, item: proto.IWebMessageInfo, al
   });
   if (direction === "in") {
     const { error } = await supabase.rpc("increment_whatsapp_chat_unread", {
-      p_vendedor_id: vendedorId,
+      p_account_id: accountId,
       p_remote_jid: canonicalConversationJid,
       p_external_id: externalId,
     });
@@ -753,7 +807,7 @@ async function persistHistorySet(
   const { data: activeLinks, error: activeLinksError } = await supabase
     .from("whatsapp_card_active_links")
     .select("card_id, contact_phone")
-    .eq("vendedor_id", state.vendedorId)
+    .eq("account_id", state.accountId)
     .eq("active", true);
   if (activeLinksError) throw activeLinksError;
 
@@ -769,7 +823,7 @@ async function persistHistorySet(
   for (const item of payload.messages || []) {
     if (!item?.message) continue;
     const remoteJid = canonicalJid(item.key?.remoteJid || "");
-    const identity = await resolveContactIdentity(state.vendedorId, remoteJid, aliases);
+    const identity = await resolveContactIdentity(state, remoteJid, aliases);
     const contactPhone = identity?.phone || "";
     const externalId = textValue(item.key?.id);
     if (!contactPhone) {
@@ -789,11 +843,12 @@ async function persistHistorySet(
       throw new Error("WhatsApp session is required to restore queued history media");
     }
     const storedMedia = await persistMessageMedia(state, item, externalId).catch((error) => {
-      logger.warn({ error, vendedorId: state.vendedorId, externalId }, "failed to persist whatsapp history media; storing metadata only");
+      logger.warn({ error, accountId: state.accountId, externalId }, "failed to persist whatsapp history media; storing metadata only");
       return null;
     });
     messageRows.push({
-      vendedor_id: state.vendedorId,
+      account_id: state.accountId,
+      vendedor_id: state.ownerVendedorId,
       ...(cardId ? { card_id: cardId } : {}),
       remote_jid: canonicalConversationJid,
       source_remote_jid: remoteJid,
@@ -816,7 +871,8 @@ async function persistHistorySet(
     const previous = latestByJid.get(canonicalConversationJid);
     if (!previous || String(previous.last_message_at || "") < createdAt) {
       latestByJid.set(canonicalConversationJid, {
-        vendedor_id: state.vendedorId,
+        account_id: state.accountId,
+        vendedor_id: state.ownerVendedorId,
         remote_jid: canonicalConversationJid,
         contact_phone: contactPhone,
         ...(contactName ? { contact_name: contactName } : {}),
@@ -833,7 +889,7 @@ async function persistHistorySet(
   for (let index = 0; index < messageRows.length; index += 250) {
     const { error } = await supabase
       .from("whatsapp_messages")
-      .upsert(messageRows.slice(index, index + 250), { onConflict: "vendedor_id,external_id" });
+      .upsert(messageRows.slice(index, index + 250), { onConflict: "account_id,external_id" });
     if (error) throw error;
   }
 
@@ -847,7 +903,8 @@ async function persistHistorySet(
     const current = chatRows.get(canonicalConversationJid) || {};
     const identity = aliases.get(remoteJid);
     chatRows.set(canonicalConversationJid, {
-      vendedor_id: state.vendedorId,
+      account_id: state.accountId,
+      vendedor_id: state.ownerVendedorId,
       remote_jid: canonicalConversationJid,
       contact_phone: contactPhone,
       ...(identity?.name ? { contact_name: identity.name } : {}),
@@ -863,7 +920,7 @@ async function persistHistorySet(
   for (let index = 0; index < rows.length; index += 250) {
     const { error } = await supabase
       .from("whatsapp_chats")
-      .upsert(rows.slice(index, index + 250), { onConflict: "vendedor_id,remote_jid" });
+      .upsert(rows.slice(index, index + 250), { onConflict: "account_id,remote_jid" });
     if (error) throw error;
   }
 
@@ -877,7 +934,7 @@ async function persistHistorySet(
   state.historyState = "syncing";
   await updateConnectionRow(state);
   logger.info(
-    { vendedorId: state.vendedorId, chats: rows.length, messages: messageRows.length, isLatest: payload.isLatest },
+    { accountId: state.accountId, chats: rows.length, messages: messageRows.length, isLatest: payload.isLatest },
     "whatsapp history persisted",
   );
 }
@@ -896,7 +953,7 @@ async function persistHistoryWithRetry(
       return;
     } catch (error) {
       lastError = error;
-      logger.warn({ error, vendedorId: state.vendedorId, attempt }, "whatsapp history persistence attempt failed");
+      logger.warn({ error, accountId: state.accountId, attempt }, "whatsapp history persistence attempt failed");
       if (attempt < 3) await sleep(1000 * attempt);
     }
   }
@@ -927,7 +984,7 @@ function scheduleHistoryReady(state: SessionState, expectedGeneration: number, i
         if (state.generation !== expectedGeneration) return;
         state.historyState = "failed";
         state.historyError = errorMessage(error);
-        logger.error({ error, vendedorId: state.vendedorId }, "failed to mark whatsapp history ready");
+        logger.error({ error, accountId: state.accountId }, "failed to mark whatsapp history ready");
       });
   }, 5000);
 }
@@ -950,11 +1007,11 @@ function processPendingHistoryFile(state: SessionState, filePath: string, expect
       state.historyError = errorMessage(error);
       state.lastPersistError = state.historyError;
       state.messageErrors += 1;
-      logger.error({ error, vendedorId: state.vendedorId, filePath }, "failed to persist queued whatsapp history");
+      logger.error({ error, accountId: state.accountId, filePath }, "failed to persist queued whatsapp history");
       try {
         await updateConnectionRow(state);
       } catch (connectionError) {
-        logger.error({ error: connectionError, vendedorId: state.vendedorId }, "failed to persist whatsapp history state");
+        logger.error({ error: connectionError, accountId: state.accountId }, "failed to persist whatsapp history state");
       }
       setTimeout(() => {
         if (state.generation === expectedGeneration) processPendingHistoryFile(state, filePath, expectedGeneration);
@@ -963,7 +1020,7 @@ function processPendingHistoryFile(state: SessionState, filePath: string, expect
 }
 
 async function restorePendingHistory(state: SessionState, expectedGeneration: number) {
-  const queueDir = historyQueueDirFor(state.vendedorId);
+  const queueDir = historyQueueDirFor(state.accountId);
   await fs.mkdir(queueDir, { recursive: true });
   const files = (await fs.readdir(queueDir))
     .filter((file) => file.endsWith(".bin"))
@@ -1008,7 +1065,7 @@ async function storeMessageWithRetry(
       return;
     } catch (error) {
       lastError = error;
-      logger.warn({ error, vendedorId: state.vendedorId, attempt }, "whatsapp message persistence attempt failed");
+      logger.warn({ error, accountId: state.accountId, attempt }, "whatsapp message persistence attempt failed");
       if (attempt < 3) await sleep(1000 * attempt);
     }
   }
@@ -1028,7 +1085,7 @@ async function storeDeliveryStatusWithRetry(
     if (state.generation !== expectedGeneration) throw new Error("Status persistence cancelled by session reset");
     try {
       const { data, error } = await supabase.rpc("update_whatsapp_message_delivery_status", {
-        p_vendedor_id: state.vendedorId,
+        p_account_id: state.accountId,
         p_external_id: event.externalId,
         p_status: event.status,
         p_occurred_at: event.occurredAt,
@@ -1038,7 +1095,7 @@ async function storeDeliveryStatusWithRetry(
       return;
     } catch (error) {
       lastError = error;
-      logger.warn({ error, vendedorId: state.vendedorId, attempt }, "whatsapp delivery status persistence attempt failed");
+      logger.warn({ error, accountId: state.accountId, attempt }, "whatsapp delivery status persistence attempt failed");
       if (attempt < 3) await sleep(1000 * attempt);
     }
   }
@@ -1064,7 +1121,7 @@ function processPendingMessageFile(state: SessionState, filePath: string, expect
       if (state.generation !== expectedGeneration) return;
       state.messageErrors += 1;
       state.lastPersistError = errorMessage(error);
-      logger.error({ error, vendedorId: state.vendedorId, filePath }, "failed to persist queued whatsapp message");
+      logger.error({ error, accountId: state.accountId, filePath }, "failed to persist queued whatsapp message");
       setTimeout(() => {
         if (state.generation === expectedGeneration) processPendingMessageFile(state, filePath, expectedGeneration);
       }, 30000);
@@ -1072,7 +1129,7 @@ function processPendingMessageFile(state: SessionState, filePath: string, expect
 }
 
 async function restorePendingMessages(state: SessionState, expectedGeneration: number) {
-  const queueDir = messageQueueDirFor(state.vendedorId);
+  const queueDir = messageQueueDirFor(state.accountId);
   await fs.mkdir(queueDir, { recursive: true });
   const files = (await fs.readdir(queueDir))
     .filter((file) => file.endsWith(".bin"))
@@ -1127,24 +1184,26 @@ function startRetentionCleanup() {
   return setInterval(() => void cleanupExpiredMessages(), 60 * 60 * 1000);
 }
 
-async function scheduleReconnect(vendedorId: string, delayMs = 2500) {
-  const state = ensureSessionState(vendedorId);
+async function scheduleReconnect(state: SessionState, delayMs = 2500) {
   if (state.reconnectTimer) return;
 
   state.reconnectTimer = setTimeout(async () => {
     state.reconnectTimer = null;
     try {
-      await startSession(vendedorId);
+      const account = await resolveAccount(state.accountId);
+      await startSession(account);
     } catch (error) {
-      logger.error({ error, vendedorId }, "reconnect failed");
-      if (!state.manualDisconnect) await scheduleReconnect(vendedorId, Math.min(delayMs * 2, 60000));
+      logger.error({ error, accountId: state.accountId }, "reconnect failed");
+      if (!state.manualDisconnect) await scheduleReconnect(state, Math.min(delayMs * 2, 60000));
     }
   }, delayMs);
 }
 
-async function startSession(vendedorId: string, forceRestart = false) {
+async function startSession(account: WhatsAppAccount, forceRestart = false) {
+  const vendedorId = account.id;
   assertValidVendedorId(vendedorId);
-  const state = ensureSessionState(vendedorId);
+  if (!account.active) throw new Error("WhatsApp account is inactive");
+  const state = ensureSessionState(account);
   if (state.resetting) throw new Error("Session reset is in progress");
 
   if (state.initializing) {
@@ -1276,7 +1335,7 @@ async function startSession(vendedorId: string, forceRestart = false) {
             await updateConnectionRow(state);
             if (state.generation !== sessionGeneration) return;
           } finally {
-            if (state.generation === sessionGeneration && shouldReconnect) await scheduleReconnect(vendedorId);
+            if (state.generation === sessionGeneration && shouldReconnect) await scheduleReconnect(state);
           }
         }
         })
@@ -1326,7 +1385,7 @@ async function startSession(vendedorId: string, forceRestart = false) {
       const identity = state.contactAliases.get(canonicalJid(jid)) || { phone, name: "" };
       state.contactAliases.set(canonicalJid(jid), identity);
       state.contactAliases.set(canonicalJid(lid), identity);
-      void trackPendingWrite(state, upsertChat(vendedorId, conversationJid(lid, phone), identity, {})).catch((error) => {
+      void trackPendingWrite(state, upsertChat(state, conversationJid(lid, phone), identity, {})).catch((error) => {
         if (state.generation !== sessionGeneration) return;
         logger.error({ error, vendedorId, lid }, "failed to persist whatsapp LID mapping");
       });
@@ -1337,9 +1396,9 @@ async function startSession(vendedorId: string, forceRestart = false) {
       for (const update of updates) {
         const remoteJid = canonicalJid(textValue(update.id));
         void trackPendingWrite(state, (async () => {
-          const identity = await resolveContactIdentity(vendedorId, remoteJid, state.contactAliases);
+          const identity = await resolveContactIdentity(state, remoteJid, state.contactAliases);
           if (!identity?.phone) return;
-          await upsertChat(vendedorId, conversationJid(remoteJid, identity.phone), identity, {
+          await upsertChat(state, conversationJid(remoteJid, identity.phone), identity, {
             ...(Number.isFinite(Number(update.unreadCount)) ? { unread_count: Math.max(0, Number(update.unreadCount)) } : {}),
             ...(typeof update.archived === "boolean" ? { archived: update.archived } : {}),
           });
@@ -1424,9 +1483,10 @@ async function waitForQrOrConnection(state: SessionState, timeoutMs = 12000) {
   return state;
 }
 
-async function resetSession(vendedorId: string, reason = "manual_reset") {
+async function resetSession(account: WhatsAppAccount, reason = "manual_reset") {
+  const vendedorId = account.id;
   assertValidVendedorId(vendedorId);
-  const state = ensureSessionState(vendedorId);
+  const state = ensureSessionState(account);
   if (state.resetting) throw new Error("Session reset is already in progress");
   state.resetting = true;
   try {
@@ -1473,13 +1533,12 @@ async function stopAllSessions(reason: string) {
   );
 }
 
-async function disconnectSession(vendedorId: string) {
-  assertValidVendedorId(vendedorId);
-  return resetSession(vendedorId, "disconnect_requested");
+async function disconnectSession(account: WhatsAppAccount) {
+  return resetSession(account, "disconnect_requested");
 }
 
-async function syncHistory(vendedorId: string) {
-  const state = await startSession(vendedorId);
+async function syncHistory(account: WhatsAppAccount) {
+  const state = await startSession(account);
   if (!state.sock || state.status !== "connected") {
     throw new Error("Session is not connected");
   }
@@ -1503,35 +1562,45 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
   return res.status(401).json({ error: "Unauthorized" });
 }
 
-function requireVendedorId(req: Request, res: Response, options: { validateInstanceName?: boolean } = {}) {
+async function requireAccount(req: Request, res: Response, options: { validateInstanceName?: boolean } = {}) {
   const validateInstanceName = options.validateInstanceName !== false;
-  const vendedorId = textValue(req.query.vendedor_id) || textValue(req.body?.vendedor_id) || textValue(req.headers["x-vendedor-id"]);
-  if (!vendedorId) {
-    res.status(400).json({ error: "vendedor_id is required" });
+  const accountId = textValue(req.query.account_id) || textValue(req.body?.account_id) || textValue(req.headers["x-account-id"])
+    || textValue(req.query.vendedor_id) || textValue(req.body?.vendedor_id) || textValue(req.headers["x-vendedor-id"]);
+  if (!accountId) {
+    res.status(400).json({ error: "account_id or vendedor_id is required" });
     return null;
   }
 
   try {
-    assertValidVendedorId(vendedorId);
+    assertValidVendedorId(accountId);
   } catch (error) {
-    res.status(400).json({ error: error instanceof Error ? error.message : "vendedor_id is invalid" });
+    res.status(400).json({ error: error instanceof Error ? error.message : "account_id is invalid" });
     return null;
   }
 
   const instanceName = textValue(req.query.instance_name) || textValue(req.body?.instance_name) || textValue(req.headers["x-instance-name"]);
-  if (validateInstanceName && instanceName && instanceName !== buildInstanceName(vendedorId)) {
-    res.status(400).json({ error: "instance_name does not match vendedor_id" });
+  if (validateInstanceName && instanceName && instanceName !== buildInstanceName(accountId)) {
+    res.status(400).json({ error: "instance_name does not match account_id" });
     return null;
   }
 
-  return vendedorId;
+  try {
+    return await resolveAccount(accountId);
+  } catch (error) {
+    if (error instanceof Error && error.message === "WhatsApp account was not found") {
+      res.status(404).json({ error: error.message });
+      return null;
+    }
+    throw error;
+  }
 }
 
 app.use(express.json({ limit: "25mb" }));
 
 app.get("/health", (_req, res) => {
   const metrics = Array.from(sessions.values()).map((state) => ({
-    vendedor_id: state.vendedorId,
+    account_id: state.accountId,
+    vendedor_id: state.ownerVendedorId,
     status: state.status,
     received: state.messagesReceived,
     stored: state.messagesStored,
@@ -1558,12 +1627,12 @@ app.use(authMiddleware);
 
 app.get("/session/status", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res);
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res);
+    if (!account) return;
 
-    const state = ensureSessionState(vendedorId);
+    const state = ensureSessionState(account);
     if (!state.sock && state.status === "disconnected") {
-      await startSession(vendedorId);
+      await startSession(account);
     }
 
     const payload = sessionStatusPayload(state);
@@ -1581,11 +1650,11 @@ app.get("/session/status", async (req, res) => {
 
 app.post("/session/refresh-qr", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res);
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res);
+    if (!account) return;
 
     const forceNew = req.body?.force_new === true;
-    const state = await startSession(vendedorId, forceNew);
+    const state = await startSession(account, forceNew);
     await waitForQrOrConnection(state);
     const payload = sessionStatusPayload(state);
     const qrImageDataUrl = state.qrRaw ? await QRCode.toDataURL(state.qrRaw) : null;
@@ -1599,10 +1668,10 @@ app.post("/session/refresh-qr", async (req, res) => {
 
 app.post("/session/disconnect", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res);
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res);
+    if (!account) return;
 
-    const state = await disconnectSession(vendedorId);
+    const state = await disconnectSession(account);
     res.json(sessionStatusPayload(state));
   } catch (error) {
     logger.error({ error }, "session/disconnect failed");
@@ -1612,11 +1681,11 @@ app.post("/session/disconnect", async (req, res) => {
 
 app.post("/session/reset", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res);
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res);
+    if (!account) return;
 
     const reason = textValue(req.body?.reason) || "manual_reset";
-    const state = await resetSession(vendedorId, reason);
+    const state = await resetSession(account, reason);
     res.json(sessionStatusPayload(state));
   } catch (error) {
     logger.error({ error }, "session/reset failed");
@@ -1626,10 +1695,10 @@ app.post("/session/reset", async (req, res) => {
 
 app.post("/session/logout", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res);
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res);
+    if (!account) return;
 
-    const state = await resetSession(vendedorId, "logout_requested");
+    const state = await resetSession(account, "logout_requested");
     res.json(sessionStatusPayload(state));
   } catch (error) {
     logger.error({ error }, "session/logout failed");
@@ -1639,8 +1708,8 @@ app.post("/session/logout", async (req, res) => {
 
 app.post("/message/send", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res, { validateInstanceName: false });
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res, { validateInstanceName: false });
+    if (!account) return;
 
     const phone = normalizePhone(textValue(req.body?.phone) || textValue(req.body?.contact_phone));
     const text = textValue(req.body?.text) || textValue(req.body?.content);
@@ -1665,7 +1734,7 @@ app.post("/message/send", async (req, res) => {
       return;
     }
 
-    const state = await startSession(vendedorId);
+    const state = await startSession(account);
     if (!state.sock || state.status !== "connected") {
       res.status(409).json({ error: "session is not connected" });
       return;
@@ -1673,24 +1742,21 @@ app.post("/message/send", async (req, res) => {
 
     const jid = `${phone}@s.whatsapp.net`;
     const attachmentBuffer = attachmentBase64 ? Buffer.from(attachmentBase64, "base64") : null;
-    const result = attachmentBuffer
-      ? attachmentMimeType.startsWith("image/")
-        ? await state.sock.sendMessage(jid, { image: attachmentBuffer, mimetype: attachmentMimeType, caption: text || undefined })
-        : attachmentMimeType.startsWith("video/")
-          ? await state.sock.sendMessage(jid, { video: attachmentBuffer, mimetype: attachmentMimeType, caption: text || undefined })
-          : attachmentMimeType.startsWith("audio/")
-            ? await state.sock.sendMessage(jid, { audio: attachmentBuffer, mimetype: attachmentMimeType, ptt: false })
-            : await state.sock.sendMessage(jid, {
-                document: attachmentBuffer,
-                fileName: attachmentFileName,
-                mimetype: attachmentMimeType,
-                caption: text || undefined,
-              })
-      : await state.sock.sendMessage(jid, { text });
+    const result = await sendWhatsAppMessage(state.sock, jid, {
+      text,
+      ...(attachmentBuffer ? {
+        media: {
+          type: mediaTypeFromMime(attachmentMimeType),
+          data: attachmentBuffer,
+          mimeType: attachmentMimeType,
+          fileName: attachmentFileName,
+        },
+      } : {}),
+    });
 
     const externalId = textValue((result as any)?.key?.id) || null;
 
-    res.json({ success: true, external_id: externalId });
+    res.json({ success: true, account_id: account.id, vendedor_id: account.ownerVendedorId, external_id: externalId });
   } catch (error) {
     logger.error({ error }, "message/send failed");
     res.status(500).json({ error: error instanceof Error ? error.message : "Internal error" });
@@ -1699,10 +1765,10 @@ app.post("/message/send", async (req, res) => {
 
 app.post("/history/sync", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res);
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res);
+    if (!account) return;
 
-    const result = await syncHistory(vendedorId);
+    const result = await syncHistory(account);
     res.json({ success: true, ...result });
   } catch (error) {
     logger.error({ error }, "history/sync failed");
@@ -1725,23 +1791,134 @@ async function restorePersistedSessions() {
   const sessionIds = await listDirectories(path.resolve(sessionRoot));
   const historyQueueIds = await listDirectories(path.resolve(sessionRoot, "..", "history-queue"));
   const messageQueueIds = await listDirectories(path.resolve(sessionRoot, "..", "message-queue"));
-  const vendedorIds = Array.from(new Set([...sessionIds, ...historyQueueIds, ...messageQueueIds]));
-  for (const vendedorId of vendedorIds) {
+  const accountIds = Array.from(new Set([...sessionIds, ...historyQueueIds, ...messageQueueIds]));
+  for (const accountId of accountIds) {
     try {
-      assertValidVendedorId(vendedorId);
-      if (sessionIds.includes(vendedorId)) {
-        await startSession(vendedorId);
+      const account = await resolveAccount(accountId);
+      if (sessionIds.includes(accountId)) {
+        await startSession(account);
       } else {
-        const state = ensureSessionState(vendedorId);
+        const state = ensureSessionState(account);
         await loadConnectionHistoryState(state);
         await restorePendingHistory(state, state.generation);
         await restorePendingMessages(state, state.generation);
       }
     } catch (error) {
-      logger.error({ error, vendedorId }, "failed to restore persisted whatsapp session");
+      logger.error({ error, accountId }, "failed to restore persisted whatsapp session");
     }
   }
-  logger.info({ sessions: sessionIds.length, queue_owners: vendedorIds.length }, "persisted whatsapp state restored");
+  logger.info({ sessions: sessionIds.length, queue_accounts: accountIds.length }, "persisted whatsapp state restored");
+}
+
+let campaignWorkerTimer: NodeJS.Timeout | null = null;
+let campaignWorkerStopping = false;
+
+async function retryOutboundJob(jobId: string, message: string, delaySeconds: number, unknown: boolean) {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) throw new Error("Supabase persistence is required");
+  const { data, error } = await supabase.rpc("retry_whatsapp_outbound_job", {
+    p_job_id: jobId,
+    p_worker_id: workerId,
+    p_error: message.slice(0, 2000),
+    p_delay_seconds: delaySeconds,
+    p_unknown: unknown,
+  });
+  if (error) throw error;
+  if (data !== true) throw new Error("WhatsApp outbound job lease is no longer owned by this worker");
+}
+
+async function processOutboundJob(job: OutboundJob) {
+  let sendAttempted = false;
+  try {
+    const account = await resolveAccount(job.account_id);
+    if (!account.active) throw new Error("WhatsApp account is inactive");
+    if (account.ownerVendedorId !== job.owner_vendedor_id) throw new Error("Outbound job account owner does not match");
+
+    const state = sessions.get(account.id);
+    if (!state?.sock || state.status !== "connected") throw new Error("WhatsApp session is not connected");
+    const phone = normalizePhone(job.contact_phone || "");
+    if (phone.length < 8) throw new Error("Outbound job phone is invalid");
+    const jid = `${phone}@s.whatsapp.net`;
+
+    if (typeof state.sock.onWhatsApp === "function") {
+      const availability = await state.sock.onWhatsApp(jid);
+      if (Array.isArray(availability) && !availability.some((item) => item?.exists === true)) {
+        throw new Error("Phone is not registered on WhatsApp");
+      }
+    }
+
+    let media: { type: "document" | "image"; data: Buffer; mimeType: string; fileName: string } | undefined;
+    if (job.storage_path) {
+      const supabase = getSupabaseAdmin();
+      if (!supabase) throw new Error("Supabase persistence is required");
+      const { data, error } = await supabase.storage.from("vendas-docs").download(job.storage_path);
+      if (error) throw error;
+      if (!data) throw new Error("Outbound media was not found");
+      if (data.size > mediaMaxBytes) throw new Error("Outbound media exceeds storage limit");
+      const buffer = Buffer.from(await data.arrayBuffer());
+      if (buffer.length > mediaMaxBytes) throw new Error("Outbound media exceeds storage limit");
+      const fileName = textValue(job.file_name) || path.basename(job.storage_path) || "document";
+      const mimeType = deriveOutboundMime(buffer, fileName, job.storage_path);
+      if (!mimeType) throw new Error("Outbound media type is not supported");
+      media = { type: mimeType.startsWith("image/") ? "image" : "document", data: buffer, mimeType, fileName };
+    }
+
+    const supabase = getSupabaseAdmin();
+    if (!supabase) throw new Error("Supabase persistence is required");
+    const { data: campaign, error: campaignError } = await supabase
+      .from("whatsapp_campaigns")
+      .select("status")
+      .eq("id", job.campaign_id)
+      .maybeSingle();
+    if (campaignError) throw campaignError;
+    if (campaign?.status !== "running") throw new Error(`WhatsApp campaign is ${textValue(campaign?.status) || "unavailable"}`);
+
+    sendAttempted = true;
+    const result = await sendWhatsAppMessage(state.sock, jid, { text: textValue(job.content), ...(media ? { media } : {}) });
+    const externalId = textValue((result as { key?: { id?: string | null } } | undefined)?.key?.id);
+    if (!externalId) throw new Error("WhatsApp send returned no message ID");
+
+    const { data: completed, error } = await supabase.rpc("complete_whatsapp_outbound_job", {
+      p_job_id: job.id,
+      p_worker_id: workerId,
+      p_external_id: externalId,
+    });
+    if (error) throw error;
+    if (completed !== true) throw new Error("WhatsApp outbound job completion was not persisted");
+    logger.info({ jobId: job.id, campaignId: job.campaign_id, accountId: job.account_id }, "whatsapp outbound job completed");
+  } catch (error) {
+    const message = errorMessage(error);
+    try {
+      await retryOutboundJob(job.id, message, sendAttempted ? 0 : 30, sendAttempted);
+    } catch (retryError) {
+      logger.error({ error: retryError, jobId: job.id, originalError: message }, "failed to report whatsapp outbound job failure");
+      return;
+    }
+    logger.warn({ jobId: job.id, accountId: job.account_id, unknown: sendAttempted, error: message }, "whatsapp outbound job was not completed");
+  }
+}
+
+async function pollCampaignWorker() {
+  if (campaignWorkerStopping) return;
+  try {
+    const supabase = getSupabaseAdmin();
+    if (!supabase) throw new Error("Supabase persistence is required");
+    const { data, error } = await supabase.rpc("lease_whatsapp_outbound_job", { p_worker_id: workerId });
+    if (error) throw error;
+    const job = (Array.isArray(data) ? data[0] : data) as OutboundJob | null | undefined;
+    if (job?.id) await processOutboundJob(job);
+  } catch (error) {
+    logger.error({ error }, "whatsapp campaign worker poll failed");
+  } finally {
+    if (!campaignWorkerStopping) campaignWorkerTimer = setTimeout(() => void pollCampaignWorker(), campaignPollMs);
+  }
+}
+
+function startCampaignWorker() {
+  if (!campaignWorkerEnabled) return;
+  campaignWorkerStopping = false;
+  void pollCampaignWorker();
+  logger.info({ workerId, pollMs: campaignPollMs }, "whatsapp campaign worker started");
 }
 
 if (!apiToken) throw new Error("API_TOKEN is required");
@@ -1751,6 +1928,7 @@ const server = app.listen(port, async () => {
   try {
     await fs.mkdir(path.resolve(sessionRoot), { recursive: true });
     await restorePersistedSessions();
+    startCampaignWorker();
     serviceReady = true;
     logger.info({ port, sessionRoot }, "whatsapp-baileys-service started");
   } catch (error) {
@@ -1761,14 +1939,14 @@ const server = app.listen(port, async () => {
 
 app.post("/chat/read", async (req, res) => {
   try {
-    const vendedorId = requireVendedorId(req, res, { validateInstanceName: false });
-    if (!vendedorId) return;
+    const account = await requireAccount(req, res, { validateInstanceName: false });
+    if (!account) return;
     const phone = normalizePhone(textValue(req.body?.phone) || textValue(req.body?.contact_phone));
     if (phone.length < 8) {
       res.status(400).json({ error: "phone is invalid" });
       return;
     }
-    const state = await startSession(vendedorId);
+    const state = await startSession(account);
     if (!state.sock || state.status !== "connected") {
       res.status(409).json({ error: "session is not connected" });
       return;
@@ -1778,7 +1956,7 @@ app.post("/chat/read", async (req, res) => {
     const { data: rows, error: messageError } = await supabase
       .from("whatsapp_messages")
       .select("external_id, remote_jid, source_remote_jid")
-      .eq("vendedor_id", vendedorId)
+      .eq("account_id", state.accountId)
       .eq("contact_phone", phone)
       .eq("direction", "in")
       .not("external_id", "is", null)
@@ -1792,12 +1970,12 @@ app.post("/chat/read", async (req, res) => {
     }));
     if (keys.length > 0) await state.sock.readMessages(keys);
     const { error: chatError } = await supabase.rpc("mark_whatsapp_chat_read", {
-      p_vendedor_id: vendedorId,
+      p_account_id: account.id,
       p_contact_phone: phone,
       p_external_ids: keys.map((key) => key.id),
     });
     if (chatError) throw chatError;
-    res.json({ success: true, read: keys.length });
+    res.json({ success: true, account_id: account.id, read: keys.length });
   } catch (error) {
     logger.error({ error }, "chat/read failed");
     res.status(500).json({ error: error instanceof Error ? error.message : "Internal error" });
@@ -1807,6 +1985,8 @@ app.post("/chat/read", async (req, res) => {
 async function shutdown(signal: string) {
   logger.info({ signal }, "shutting down whatsapp-baileys-service");
   serviceReady = false;
+  campaignWorkerStopping = true;
+  if (campaignWorkerTimer) clearTimeout(campaignWorkerTimer);
   clearInterval(retentionCleanupTimer);
   server.close(async () => {
     try {
