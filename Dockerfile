@@ -1,4 +1,4 @@
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 
 WORKDIR /app
 
@@ -7,7 +7,7 @@ RUN apk add --no-cache git openssh-client \
     && git config --global --add url."https://github.com/".insteadOf "git@github.com:"
 
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --include=dev
 
 FROM deps AS build
 
@@ -18,7 +18,7 @@ COPY src ./src
 
 RUN npm run build
 
-FROM node:20-alpine AS runtime
+FROM node:22-alpine AS runtime
 
 WORKDIR /app
 ENV NODE_ENV=production
