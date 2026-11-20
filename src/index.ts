@@ -1270,7 +1270,9 @@ async function startSession(account: WhatsAppAccount, forceRestart = false) {
       auth: authState,
       printQRInTerminal: false,
       logger,
-      browser: Browsers.macOS("Desktop"),
+      // Desktop sub-platforms (DARWIN/WIN32) are rejected by WhatsApp before
+      // emitting a QR. WEB_BROWSER keeps the Web handshake coherent.
+      browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
       markOnlineOnConnect: false,
